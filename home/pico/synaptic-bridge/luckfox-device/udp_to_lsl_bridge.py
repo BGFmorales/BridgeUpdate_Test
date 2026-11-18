@@ -242,7 +242,19 @@ def normalize_config(raw, path, legacy_overrides=None):
             raise ConfigError(f"dos dispositivos reciben del puerto {route[0]} desde {who}")
         routes.add(route)
 
-    return {"bridge": g, "devices": devices, "legacy": legacy}
+    # Dos streams con el mismo nombre: un consumidor que busca por nombre
+    # (LabRecorder, la GUI) puede conectarse a cualquiera de los dos y saltar
+    # al otro al reconectarse. No se rechaza (rompería configs existentes),
+    # pero se avisa en el log y en --check.
+    warnings, seen = [], {}
+    for d in devices:
+        for sname in [d["stream_name"]] + ([d["stream_name"] + "_raw"] if d["publish_raw"] else []):
+            if sname in seen and seen[sname] != d["name"]:
+                warnings.append(f"los dispositivos '{seen[sname]}' y '{d['name']}' publican un "
+                                f"stream con el mismo nombre '{sname}': ponles stream_name distintos")
+            seen.setdefault(sname, d["name"])
+
+    return {"bridge": g, "devices": devices, "legacy": legacy, "warnings": warnings}
 
 
 def device_identity(dcfg, gcfg):
@@ -966,6 +978,8 @@ class Bridge:
         elif not g["status_stream"]:
             self.status_outlet = None
 
+        for w in cfg.get("warnings", []):
+            log.warning("config: %s", w)
         if cfg["legacy"] and initial:
             log.info("config en formato antiguo (un dispositivo); ver README_bridge_v2.md "
                      "para usar varios dispositivos y stream crudo")
@@ -1196,6 +1210,7 @@ def run_check(cfg, samples_per_window, n_windows, as_json):
             "stages": stages, "errors": errors,
         }
     report["ok"] = ok
+    report["warnings"] = list(cfg.get("warnings", []))
     if as_json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
     else:
@@ -1208,6 +1223,8 @@ def run_check(cfg, samples_per_window, n_windows, as_json):
                 print(f"    ! {e}")
             print(f"    total {r['pipeline_avg_ms']:.3f} ms por ventana de {samples_per_window} muestras "
                   f"({r['window_ms']:.1f} ms de señal)")
+        for w in report["warnings"]:
+            print(f"AVISO: {w}")
         print("OK" if ok else "HAY ERRORES")
     return 0 if ok else 1
 
