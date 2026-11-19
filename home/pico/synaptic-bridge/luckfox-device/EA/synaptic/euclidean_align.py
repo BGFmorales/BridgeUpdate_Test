@@ -334,6 +334,10 @@ class StreamingWhitener:
         self.n_channels_ = None
         self.n_seen_ = 0
         self._since_refresh = 0
+        # Muestras vistas desde el arranque en frío. Mientras la memoria
+        # exponencial todavía "recuerda" la identidad inicial, se usa la media
+        # acumulada real (ver _update). Un seed() lo da por calentado.
+        self._warm = 0
 
     @property
     def memory_samples(self):
@@ -364,17 +368,27 @@ class StreamingWhitener:
         self.C_ = C.copy()
         self.mean_ = np.zeros(self.n_channels_)
         self.n_seen_ = int(n_seen)
+        self._warm = float("inf")           # ya parte de una referencia
         self._refresh()
         return self
 
     def _update(self, chunk):
         m = chunk.shape[0]
         lam_m = self.lambda_ ** m                     # block forgetting over the chunk
+        # Peso del chunk nuevo. Al arrancar en frío, C_ vale la identidad
+        # (sin relación con la escala de la señal): con solo el olvido
+        # exponencial, la salida tardaría varias constantes de tiempo en
+        # estabilizarse (con time_constant=200 s, la amplitud seguía
+        # cambiando x60 durante 10 min). Con max(...) los primeros chunks
+        # se promedian como media acumulada (sin sesgo) y después se pasa
+        # al olvido exponencial normal.
+        self._warm += m
+        w = max(1.0 - lam_m, m / self._warm)
         if self.subtract_mean:
-            self.mean_ = lam_m * self.mean_ + (1.0 - lam_m) * chunk.mean(axis=0)
+            self.mean_ = (1.0 - w) * self.mean_ + w * chunk.mean(axis=0)
             chunk = chunk - self.mean_
         Rc = (chunk.T @ chunk) / m
-        self.C_ = lam_m * self.C_ + (1.0 - lam_m) * Rc
+        self.C_ = (1.0 - w) * self.C_ + w * Rc
         self.n_seen_ += m
         self._since_refresh += m
 
@@ -389,7 +403,11 @@ class StreamingWhitener:
             chunk = chunk[None, :]
         self._ensure(chunk.shape[1])
         self._update(chunk)
-        if self._since_refresh >= self.refresh_every:
+        # Durante el arranque se refresca en cada chunk (a partir de unas
+        # pocas muestras por canal) para no pasar la señal sin blanquear
+        # durante los primeros `refresh_every` y luego dar un salto.
+        warming = self._warm < self.refresh_every and self._warm >= 4 * chunk.shape[1]
+        if warming or self._since_refresh >= self.refresh_every:
             self._refresh()
         out = (chunk - self.mean_) if self.subtract_mean else chunk
         return out @ self.W_
